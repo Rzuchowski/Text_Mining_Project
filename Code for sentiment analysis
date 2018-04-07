@@ -1,0 +1,121 @@
+#Install and load packages
+install.packages("RTextTools")
+install.packages("RSiteCatalyst")
+install.packages("rtweet")
+install.packages("twitteR")
+library(RTextTools)
+library(RSiteCatalyst)
+library(rtweet)
+library(dplyr)
+library(purrr)
+library(twitteR)
+library(lubridate)
+library(scales)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(tidytext)
+
+#Alternative version using 'twitteR'-package.
+#Setting credentials
+#OBS! I have all the keys linked to my Twitter account.
+twitteR::setup_twitter_oauth(consumer_key ="UQOfuzCl2pkXeQq7DkzMBRQ4g", consumer_secret="I3VdmiW4VPuqcInuiWZt8BcsiMrOiB1NftefDnSKrheUzylpZ7",access_token = "853717471882350598-J8sK0fdvXK88lXxlu91KMCiYcnbKHj5", access_secret = "hKSUd3Zu9ALSzWNLh0qXh7C3akuD8RDEMhxeRtBUZeMaM")
+
+#Downloading 3000 of Trumps tweets and setting as a data frame
+TrumpTweets <- twitteR::userTimeline("realDonaldTrump", n = 3200)
+TrumpTweets_df <- tbl_df(map_df(TrumpTweets, as.data.frame))
+
+
+
+#Dividing the tweets up into which platform they where sent from.
+tweetsplatform <- TrumpTweets_df %>%
+  select(id, statusSource, text, created) %>%
+  extract(statusSource, "source", "Twitter for (.*?)<") %>%
+  filter(source %in% c("iPhone", "Android"))
+
+#Visualising the data
+#Won't work because of timezone problems
+tweetsplatform %>%
+  count(source, hour = hour(with_tz(created, "EST"))) %>%
+  mutate(percent = n / sum(n)) %>%
+  ggplot(aes(hour, percent, color = source)) +
+  geom_line() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(x = "Hour of day (EST)",
+       y = "% of tweets",
+       color = "")
+
+#Divided up into if there were a picture or a link attached or not
+tweet_picture_counts <- tweetsplatform %>%
+  filter(!str_detect(text, '^"')) %>%
+  count(source,
+        picture = ifelse(str_detect(text, "t.co"),
+                         "Picture/link", "No picture/link"))
+#Plotting the above
+ggplot(tweet_picture_counts, aes(source, n, fill = picture)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "", y = "Number of tweets", fill = "")
+
+#Comparision of words
+#Creating a tibble of all the words within the tweets
+reg <- "([^A-Za-z\\d#@']|'(?![A-Za-z\\d#@]))"
+tweet_words <- tweetsplatform%>%
+  filter(!str_detect(text, '^"')) %>%
+  mutate(text = str_replace_all(text, "https://t.co/[A-Za-z\\d]+|&amp;", "")) %>%
+  unnest_tokens(word, text, token = "regex", pattern = reg) %>%
+  filter(!word %in% stop_words$word,
+         str_detect(word, "[a-z]"))
+#Plotting the above
+tweet_words
+
+#Ratio between iPhone and Android tweets
+#OBS! Error in 'mutate_each' - maybe use 'mutate_at' eller 'mutate_all'
+android_iphone_ratios <- tweet_words %>%
+  count(word, source) %>%
+  filter(sum(n) >= 5) %>%
+  spread(source, n, fill = 0) %>%
+  ungroup() %>%
+  mutate_each(funs((. + 1) / sum(. + 1)), -word) %>%
+  mutate(logratio = log2(Android / iPhone)) %>%
+  arrange(desc(logratio))
+
+#Sentiment analysis
+#NRC: NRC Word-Emotion Association Lexicon
+#http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm
+nrc <- sentiments %>%
+  filter(lexicon == "nrc") %>%
+  dplyr::select(word, sentiment)
+
+nrc
+
+#Counting the words within each category
+sources <- tweet_words %>%
+  group_by(source) %>%
+  mutate(total_words = n()) %>%
+  ungroup() %>%
+  distinct(id, source, total_words)
+
+by_source_sentiment <- tweet_words %>%
+  inner_join(nrc, by = "word") %>%
+  count(sentiment, id) %>%
+  ungroup() %>%
+  complete(sentiment, id, fill = list(n = 0)) %>%
+  inner_join(sources) %>%
+  group_by(source, sentiment, total_words) %>%
+  summarize(words = sum(n)) %>%
+  ungroup()
+
+head(by_source_sentiment)
+
+#NB! Here we see that 198 words of the total 4293 words are associated with anger.
+
+#We then want to measure how much more likely the Android account is to use an 
+#emotionally-charged term relative to the iPhone account. Since this is count data, 
+#we can use a Poisson test to measure the difference:
+library(broom)
+
+sentiment_differences <- by_source_sentiment %>%
+  group_by(sentiment) %>%
+  do(tidy(poisson.test(.$words, .$total_words)))
+
+sentiment_differences
